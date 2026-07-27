@@ -1,0 +1,71 @@
+import cv2
+import math
+from cvzone.HandTrackingModule import HandDetector
+
+# เปิดกล้อง
+cap = cv2.VideoCapture(0)
+
+# ตั้งค่าตัวตรวจจับมือ
+detector = HandDetector(detectionCon=0.8, maxHands=2)
+
+print("Starting Rock-Solid Hand Sign Detection...")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # กลับภาพให้เหมือนกระจก
+    frame = cv2.flip(frame, 1)
+
+    # ตรวจจับมือ
+    hands, frame = detector.findHands(frame)
+
+    total_fingers = 0
+
+    if hands:
+        for hand in hands:
+            # ดึงสถานะนิ้ว [โป้ง, ชี้, กลาง, นาง, ก้อย] จาก cvzone
+            fingers = detector.fingersUp(hand)
+            lm_list = hand["lmList"]  # พิกัดข้อต่อนิ้วมือ 21 จุด
+
+            # --- แก้ไขนิ้วโป้งด้วยระยะทาง (Distance-based Thumb Detection) ---
+            # จุดที่ 4 = ปลายนิ้วโป้ง
+            # จุดที่ 17 = โคนนิ้วก้อย (MCP)
+            # จุดที่ 5 = โคนนิ้วชี้
+            thumb_tip = lm_list[4][:2]
+            pinky_mcp = lm_list[17][:2]
+            index_mcp = lm_list[5][:2]
+
+            # คำนวณระยะทางจากปลายนิ้วโป้งไปโคนนิ้วก้อย
+            dist_thumb_to_pinky = math.hypot(thumb_tip[0] - pinky_mcp[0], thumb_tip[1] - pinky_mcp[1])
+            # คำนวณความกว้างฝ่ามือ (โคนนิ้วชี้ไปโคนนิ้วก้อย) เอาไว้เป็นเกณฑ์อ้างอิง
+            palm_width = math.hypot(index_mcp[0] - pinky_mcp[0], index_mcp[1] - pinky_mcp[1])
+
+            # ถ้าระยะปลายนิ้วโป้งอยู่ห่างจากโคนนิ้วก้อยมากกว่าความกว้างฝ่ามือ แปลว่า "กางนิ้วโป้ง"
+            if dist_thumb_to_pinky > palm_width * 1.2:
+                fingers[0] = 1
+            else:
+                fingers[0] = 0
+
+            # รวมนิ้วที่ชูขึ้น
+            total_fingers += sum(fingers)
+
+    # แสดงผลบนหน้าจอ
+    display_text = "Wait for Hand Sign..."
+    if 1 <= total_fingers <= 10:
+        display_text = f"NUMBER: {total_fingers}"
+    elif total_fingers > 10:
+        display_text = "MAX SUPPORT: 10!"
+
+    cv2.rectangle(frame, (20, 20), (450, 90), (0, 0, 0), -1)
+    cv2.putText(frame, display_text, (30, 70), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+
+    cv2.imshow("Real Hand Sign Detection 1-10 (CVZone Pro)", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
