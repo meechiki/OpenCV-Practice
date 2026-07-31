@@ -3,32 +3,54 @@ import subprocess
 import math
 import os
 import time
+import argparse
+import json
 import urllib.request
 
 print("=" * 75)
-print(f"  🚀 Real-Time International Golden Ratio Analyzer (Python {sys.version.split()[0]})")
+print(f"  🚀 Real-Time International Golden Ratio Analyzer v2 (Python {sys.version.split()[0]})")
 print("=" * 75)
 
 # ==============================================================================
-# 1. ตรวจสอบและติดตั้ง OpenCV / NumPy
+# 1. ตรวจสอบและติดตั้งไลบรารีที่จำเป็น (opencv, numpy, mediapipe)
 # ==============================================================================
-try:
-    import cv2
-    import numpy as np
-except ImportError:
-    print("[Auto-Install] กำลังติดตั้ง opencv-python และ numpy...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "opencv-python", "numpy"])
-    import cv2
-    import numpy as np
+def ensure_package(import_name, pip_name=None):
+    pip_name = pip_name or import_name
+    try:
+        return __import__(import_name)
+    except ImportError:
+        print(f"[Auto-Install] กำลังติดตั้ง {pip_name} ...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+            return __import__(import_name)
+        except Exception as e:
+            print(f"[Warning] ติดตั้ง {pip_name} ไม่สำเร็จ: {e}")
+            return None
+
+cv2 = ensure_package("cv2", "opencv-python")
+np = ensure_package("numpy")
+
+if cv2 is None or np is None:
+    print("❌ [Fatal] ไม่สามารถติดตั้ง opencv-python / numpy ได้ กรุณาติดตั้งด้วยตนเองแล้วรันใหม่")
+    input("กด Enter เพื่อปิด...")
+    sys.exit(1)
 
 HAS_MEDIAPIPE = False
 mp_face_mesh = None
-
 try:
-    import mediapipe.solutions.face_mesh as mp_face_mesh
-    HAS_MEDIAPIPE = True
-except Exception:
+    mp_module = ensure_package("mediapipe")
+    if mp_module is not None:
+        import mediapipe.solutions.face_mesh as mp_face_mesh
+        HAS_MEDIAPIPE = True
+except Exception as e:
+    print(f"[Info] MediaPipe ไม่พร้อมใช้งาน ({e}) — จะใช้ระบบตรวจจับสำรอง (Haar Cascade) แทน")
     HAS_MEDIAPIPE = False
+
+if HAS_MEDIAPIPE:
+    print("[Info] ใช้ MediaPipe Face Mesh (แม่นยำสูง, 468 จุด)")
+else:
+    print("[Info] ใช้ OpenCV Haar Cascade (แม่นยำน้อยกว่า แต่เบากว่า)")
+
 
 def get_safe_cascade(filename):
     try:
@@ -61,15 +83,66 @@ def get_safe_cascade(filename):
 
 PHI = (1 + math.sqrt(5)) / 2  # ค่าคงที่สัดส่วนทองคำ 1.618
 
+
 # ==============================================================================
-# 2. คลาสวิเคราะห์สัดส่วนใบหน้า Real-Time (Clean English Text Output)
+# 2. ตัวช่วย Smoothing (ลดอาการสั่น/กระตุกของจุดสัดส่วน)
+# ==============================================================================
+class PointSmoother:
+    """Exponential Moving Average — ทำให้จุดต่างๆ นิ่งขึ้นแต่ยังตามการขยับหน้าได้ทัน"""
+
+    def __init__(self, alpha=0.45):
+        self.alpha = alpha
+        self.state = {}
+
+    def smooth(self, pts):
+        out = {}
+        for key, (x, y) in pts.items():
+            if key in self.state:
+                px, py = self.state[key]
+                nx = px + self.alpha * (x - px)
+                ny = py + self.alpha * (y - py)
+            else:
+                nx, ny = x, y
+            out[key] = (int(nx), int(ny))
+            self.state[key] = (nx, ny)
+        return out
+
+    def reset(self):
+        self.state = {}
+
+
+# ==============================================================================
+# 3. คลาสวิเคราะห์สัดส่วนใบหน้า Real-Time
 # ==============================================================================
 class RealtimeGoldenAnalyzer:
-    def __init__(self):
+    def __init__(self, detect_every_n_frames=5):
         self.face_cascade = get_safe_cascade('haarcascade_frontalface_default.xml')
+        self.detect_every_n = max(1, detect_every_n_frames)
+        self._frame_count = 0
+        self._last_face_box = None  # (fx, fy, fw, fh) cached between detections
 
     def _dist(self, p1, p2):
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+    def _detect_face_box(self, gray):
+        """ตรวจจับใบหน้าด้วย Haar Cascade แต่ไม่ทำทุกเฟรม เพื่อประหยัด CPU"""
+        self._frame_count += 1
+        need_fresh_detect = (
+            self._last_face_box is None
+            or self._frame_count % self.detect_every_n == 0
+        )
+        if need_fresh_detect and self.face_cascade is not None and not self.face_cascade.empty():
+            faces = self.face_cascade.detectMultiScale(
+                gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)
+            )
+            if len(faces) > 0:
+                # เลือกใบหน้าที่ใหญ่ที่สุด (ใกล้กล้องที่สุด) กันเลือกผิดตัว
+                faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+                self._last_face_box = tuple(faces[0])
+            else:
+                self._last_face_box = None
+
+        return self._last_face_box
 
     def analyze(self, frame, landmarks_pixel=None):
         h, w, _ = frame.shape
@@ -98,32 +171,31 @@ class RealtimeGoldenAnalyzer:
                 'lower_lip_bot': landmarks_pixel[17]
             }
         else:
-            # OpenCV Dynamic Feature Extractor Real-Time
-            fx, fy, fw, fh = int(w * 0.35), int(h * 0.22), int(w * 0.3), int(h * 0.52)
-            if self.face_cascade is not None and not self.face_cascade.empty():
-                faces = self.face_cascade.detectMultiScale(gray, 1.2, 4)
-                if len(faces) > 0:
-                    (fx, fy, fw, fh) = faces[0]
+            # --- FIX: ถ้าไม่เจอหน้าจริงๆ ให้คืน None แทนการเดาตำแหน่งกลางจอ ---
+            face_box = self._detect_face_box(gray)
+            if face_box is None:
+                return None
+            fx, fy, fw, fh = face_box
 
             # ตรวจจับตำแหน่งตาจริงจากม่านตามืด
-            eye_roi = gray[fy + int(fh*0.2):fy + int(fh*0.45), fx:fx + fw]
+            eye_roi = gray[fy + int(fh * 0.2):fy + int(fh * 0.45), fx:fx + fw]
             left_e_x, right_e_x = int(fw * 0.3), int(fw * 0.7)
             eye_y = int(fh * 0.35)
 
             if eye_roi.size > 0:
                 h_roi, w_roi = eye_roi.shape
-                l_part = eye_roi[:, :w_roi//2]
-                r_part = eye_roi[:, w_roi//2:]
+                l_part = eye_roi[:, :w_roi // 2]
+                r_part = eye_roi[:, w_roi // 2:]
                 if l_part.size > 0 and r_part.size > 0:
                     _, _, min_l, _ = cv2.minMaxLoc(l_part)
                     _, _, min_r, _ = cv2.minMaxLoc(r_part)
                     left_e_x = min_l[0]
-                    right_e_x = w_roi//2 + min_r[0]
+                    right_e_x = w_roi // 2 + min_r[0]
                     eye_y = int(fh * 0.2) + (min_l[1] + min_r[1]) // 2
 
             # ตรวจจับริมฝีปากจริงจากสเปกตรัมสี HSV
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            mouth_roi = hsv[fy + int(fh*0.65):fy + int(fh*0.9), fx + int(fw*0.2):fx + int(fw*0.8)]
+            mouth_roi = hsv[fy + int(fh * 0.65):fy + int(fh * 0.9), fx + int(fw * 0.2):fx + int(fw * 0.8)]
             m_lx, m_rx, mouth_y = int(fw * 0.32), int(fw * 0.68), int(fh * 0.78)
 
             if mouth_roi.size > 0:
@@ -208,7 +280,7 @@ class RealtimeGoldenAnalyzer:
         overall = (sc_face * 0.25 + sc_mn * 0.20 + sc_nmc * 0.20 + sc_lip * 0.15 + sc_eye * 0.10 + sc_thirds * 0.10)
 
         # ----------------------------------------------------------------------
-        # การจำแนกลักษณะใบหน้าภาษาอังกฤษล้วน (Clean English Text Output)
+        # การจำแนกลักษณะใบหน้า
         # ----------------------------------------------------------------------
         if r_face > 1.68:
             face_shape = "Slender Golden Oval"
@@ -259,7 +331,8 @@ class RealtimeGoldenAnalyzer:
         return {
             'pts': pts,
             'ratios': {'face': r_face, 'mn': r_mn, 'nmc': r_nmc, 'lip': r_lip, 'eye': r_eye},
-            'scores': {'face': sc_face, 'mn': sc_mn, 'nmc': sc_nmc, 'lip': sc_lip, 'eye': sc_eye, 'thirds': sc_thirds, 'overall': overall},
+            'scores': {'face': sc_face, 'mn': sc_mn, 'nmc': sc_nmc, 'lip': sc_lip, 'eye': sc_eye,
+                       'thirds': sc_thirds, 'overall': overall},
             'classifications': {
                 'face_shape': face_shape,
                 'forehead_shape': forehead_shape,
@@ -270,7 +343,7 @@ class RealtimeGoldenAnalyzer:
             }
         }
 
-    def draw_hud(self, img, analysis):
+    def draw_hud(self, img, analysis, fps=0.0):
         pts = analysis['pts']
         sc = analysis['scores']
         ra = analysis['ratios']
@@ -282,7 +355,6 @@ class RealtimeGoldenAnalyzer:
         WHITE = (240, 240, 240)
         DARK_BG = (15, 15, 25)
 
-        # วาดเส้นสัดส่วนทองคำบนใบหน้า Real-Time
         cv2.line(img, pts['forehead'], pts['chin'], CYAN, 2, cv2.LINE_AA)
         cv2.line(img, pts['left_cheek'], pts['right_cheek'], GOLD, 2, cv2.LINE_AA)
         cv2.line(img, pts['left_eye_outer'], pts['right_eye_outer'], GOLD, 1, cv2.LINE_AA)
@@ -293,7 +365,6 @@ class RealtimeGoldenAnalyzer:
             cv2.circle(img, pt, 4, GREEN, -1, cv2.LINE_AA)
             cv2.circle(img, pt, 6, GOLD, 1, cv2.LINE_AA)
 
-        # แผงวิเคราะห์ย่อย Real-Time ด้านขวา
         h, w, _ = img.shape
         pw = 450
         overlay = img.copy()
@@ -305,7 +376,7 @@ class RealtimeGoldenAnalyzer:
         y = 35
 
         cv2.putText(img, "REAL-TIME GOLDEN RATIO ANALYZER", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, GOLD, 2, cv2.LINE_AA)
-        cv2.putText(img, "INTERNATIONAL AESTHETICS (PHI = 1.618)", (x, y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, CYAN, 1, cv2.LINE_AA)
+        cv2.putText(img, f"PHI = 1.618   |   FPS: {fps:.1f}", (x, y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, CYAN, 1, cv2.LINE_AA)
 
         y += 55
         overall = sc['overall']
@@ -330,7 +401,7 @@ class RealtimeGoldenAnalyzer:
         ]
 
         for title, desc in features:
-            cv2.putText(img, f"• {title}:", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, GOLD, 1, cv2.LINE_AA)
+            cv2.putText(img, f"- {title}:", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, GOLD, 1, cv2.LINE_AA)
             cv2.putText(img, desc, (x + 110, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, WHITE, 1, cv2.LINE_AA)
             y += 24
 
@@ -339,15 +410,15 @@ class RealtimeGoldenAnalyzer:
         y += 22
 
         metrics = [
-            ("Face Height/Width", ra['face'], sc['face'], 1.618),
-            ("Mouth/Nose Width", ra['mn'], sc['mn'], 1.618),
-            ("Nose-Chin/Mouth-Chin", ra['nmc'], sc['nmc'], 1.618),
-            ("Lower/Upper Lip", ra['lip'], sc['lip'], 1.618),
-            ("Eye Gap/Eye Width", ra['eye'], sc['eye'], 1.000),
-            ("Facial Thirds Symmetry", sc['thirds'] / 100.0 * 1.618, sc['thirds'], 1.000)
+            ("Face Height/Width", ra['face'], sc['face']),
+            ("Mouth/Nose Width", ra['mn'], sc['mn']),
+            ("Nose-Chin/Mouth-Chin", ra['nmc'], sc['nmc']),
+            ("Lower/Upper Lip", ra['lip'], sc['lip']),
+            ("Eye Gap/Eye Width", ra['eye'], sc['eye']),
+            ("Facial Thirds Symmetry", sc['thirds'] / 100.0 * 1.618, sc['thirds'])
         ]
 
-        for name, val, score_val, target in metrics:
+        for name, val, score_val in metrics:
             cv2.putText(img, name, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, WHITE, 1, cv2.LINE_AA)
             cv2.putText(img, f"{val:.2f} ({score_val:.0f}%)", (x + 220, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, GOLD, 1, cv2.LINE_AA)
 
@@ -362,78 +433,144 @@ class RealtimeGoldenAnalyzer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, CYAN, 1, cv2.LINE_AA)
         return img
 
+
+def save_report(frame, analysis, out_dir="saved_reports"):
+    """บันทึกทั้งภาพ (.jpg) และข้อมูลตัวเลข (.json) เพื่อให้ใช้ต่อได้จริง"""
+    os.makedirs(out_dir, exist_ok=True)
+    ts = int(time.time())
+    img_path = os.path.join(out_dir, f"golden_ratio_{ts}.jpg")
+    json_path = os.path.join(out_dir, f"golden_ratio_{ts}.json")
+
+    cv2.imwrite(img_path, frame)
+
+    data = {
+        "timestamp": ts,
+        "ratios": analysis["ratios"],
+        "scores": analysis["scores"],
+        "classifications": analysis["classifications"],
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return img_path, json_path
+
+
 # ==============================================================================
-# 3. โปรแกรมหลัก (Real-Time Application Loop)
+# 4. โปรแกรมหลัก (Real-Time Application Loop)
 # ==============================================================================
 def main():
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    parser = argparse.ArgumentParser(description="Real-Time Golden Ratio Face Analyzer")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--detect-every", type=int, default=5,
+                         help="ตรวจจับใบหน้าใหม่ทุกกี่เฟรม เมื่อไม่มี MediaPipe (ค่ายิ่งสูง = เร็วขึ้นแต่ตอบสนองช้าลง)")
+    args = parser.parse_args()
+
+    cap = cv2.VideoCapture(args.camera)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
     if not cap.isOpened():
-        print("❌ [Error] ไม่สามารถเปิดกล้อง Webcam ได้")
+        print(f"❌ [Error] ไม่สามารถเปิดกล้อง Webcam (index={args.camera}) ได้")
+        print("   ลองตรวจสอบว่ามีโปรแกรมอื่นใช้กล้องอยู่หรือไม่ หรือลองเปลี่ยน --camera 1")
         input("กด Enter เพื่อปิด...")
         return
 
-    analyzer = RealtimeGoldenAnalyzer()
+    analyzer = RealtimeGoldenAnalyzer(detect_every_n_frames=args.detect_every)
+    smoother = PointSmoother(alpha=0.45)
     face_mesh = None
 
     if HAS_MEDIAPIPE:
-        face_mesh = mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6
-        )
+        try:
+            face_mesh = mp_face_mesh.FaceMesh(
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.6,
+                min_tracking_confidence=0.6
+            )
+        except Exception as e:
+            print(f"[Warning] เปิด MediaPipe FaceMesh ไม่สำเร็จ ({e}) — ใช้ Haar Cascade แทน")
+            face_mesh = None
 
-    os.makedirs("saved_reports", exist_ok=True)
-    window_name = "Golden Ratio Face Analyzer - Real-Time Clean Output"
+    window_name = "Golden Ratio Face Analyzer v2 - Real-Time"
 
     print("=" * 70)
-    print("  🚀 ระบบวัดสัดส่วนทองคำใบหน้าแบบ Real-Time พร้อมใช้งาน (Clean Output):")
-    print("  • ลบเครื่องหมาย ???? ออกเรียบร้อย แสดงผลภาษาอังกฤษอย่างคมชัด 100%")
-    print("  • กดปุ่ม [S] เพื่อบันทึกภาพรายงานผลลงเครื่อง")
-    print("  • กดปุ่ม [Q] เพื่อออกจากโปรแกรม")
+    print("  🚀 ระบบวัดสัดส่วนทองคำใบหน้าแบบ Real-Time (v2 - Optimized):")
+    print("  • ตรวจจับใบหน้าไม่เจอ = แจ้งเตือนจริง ไม่เดาตำแหน่งมั่ว")
+    print("  • มี Point Smoothing ลดอาการสั่นของจุดวัด")
+    print("  • Haar Cascade ไม่ต้องรันทุกเฟรม -> เร็วขึ้น")
+    print("  • กด [S] บันทึกภาพ + ข้อมูล JSON | กด [Q] ออกจากโปรแกรม")
     print("=" * 70)
 
-    while True:
-        success, frame = cap.read()
-        if not success:
-            break
+    prev_time = time.time()
+    fps = 0.0
 
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                print("⚠️  [Warning] อ่านเฟรมจากกล้องไม่สำเร็จ กำลังลองใหม่...")
+                time.sleep(0.05)
+                continue
 
-        landmarks_pixel = None
-        if HAS_MEDIAPIPE and face_mesh:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = face_mesh.process(rgb)
-            if res.multi_face_landmarks:
-                lm_list = res.multi_face_landmarks[0].landmark
-                landmarks_pixel = [(int(lm.x * w), int(lm.y * h)) for lm in lm_list]
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
 
-        analysis = analyzer.analyze(frame, landmarks_pixel)
+            landmarks_pixel = None
+            if face_mesh is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb.flags.writeable = False
+                res = face_mesh.process(rgb)
+                if res.multi_face_landmarks:
+                    lm_list = res.multi_face_landmarks[0].landmark
+                    landmarks_pixel = [(int(lm.x * w), int(lm.y * h)) for lm in lm_list]
 
-        if analysis:
-            frame = analyzer.draw_hud(frame, analysis)
-        else:
-            cv2.putText(frame, "Position Face in Center of Camera...", (50, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+            analysis = analyzer.analyze(frame, landmarks_pixel)
 
-        cv2.imshow(window_name, frame)
+            # คำนวณ FPS แบบ smoothed
+            now = time.time()
+            inst_fps = 1.0 / max(1e-6, (now - prev_time))
+            fps = fps * 0.9 + inst_fps * 0.1
+            prev_time = now
 
-        key = cv2.waitKey(30) & 0xFF
-        if key != 255:
-            ch = chr(key).lower() if key < 256 else ''
-            if ch == 'q' or key == 27:
-                break
-            elif ch == 's':
-                fn = f"saved_reports/golden_ratio_realtime_{int(time.time())}.jpg"
-                cv2.imwrite(fn, frame)
-                print(f"📸 บันทึกภาพรายงานผลสำเร็จที่: {fn}")
+            if analysis:
+                analysis['pts'] = smoother.smooth(analysis['pts'])
+                frame = analyzer.draw_hud(frame, analysis, fps=fps)
+            else:
+                smoother.reset()
+                cv2.putText(frame, "Position Face in Center of Camera...", (50, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame, f"FPS: {fps:.1f}", (50, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            cv2.imshow(window_name, frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key != 255:
+                ch = chr(key).lower() if key < 256 else ''
+                if ch == 'q' or key == 27:
+                    break
+                elif ch == 's':
+                    if analysis:
+                        img_path, json_path = save_report(frame, analysis)
+                        print(f"📸 บันทึกสำเร็จ: {img_path}")
+                        print(f"📄 ข้อมูลตัวเลข: {json_path}")
+                    else:
+                        print("⚠️  ยังไม่เจอใบหน้า ไม่สามารถบันทึกได้")
+
+    except KeyboardInterrupt:
+        print("\n[Info] หยุดโปรแกรมโดยผู้ใช้ (Ctrl+C)")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if face_mesh is not None:
+            try:
+                face_mesh.close()
+            except Exception:
+                pass
+        print("[Info] ปิดโปรแกรมเรียบร้อย")
+
 
 if __name__ == "__main__":
     main()
